@@ -1,14 +1,13 @@
-import OpenAI from 'openai';
 import express from 'express';
 import cors from 'cors';
+
+// Groq client via fetch (API stile OpenAI)
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
 
 app.post('/api/ai-chat', async (req, res) => {
   try {
@@ -37,23 +36,39 @@ Domanda dell'utente:
 ${question}
     `.trim();
 
-    const completion = await client.chat.completions.create({
-      model: 'gpt-4.1-mini',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt }
-      ],
-      temperature: 0.3
+    // Chiamata a Groq (modello compatibile OpenAI)
+    const groqResponse = await fetch(GROQ_API_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'llama-3.1-8b-instant', // modello Groq gratuito e veloce [web:122][web:128]
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt }
+        ],
+        temperature: 0.3
+      })
     });
 
+    if (!groqResponse.ok) {
+      const errText = await groqResponse.text().catch(() => '');
+      console.error('Groq API error:', groqResponse.status, errText);
+      return res.status(500).json({ error: 'Errore chiamando Groq API', status: groqResponse.status });
+    }
+
+    const data = await groqResponse.json();
+
     const answer =
-      completion.choices?.[0]?.message?.content ||
+      data.choices?.[0]?.message?.content ||
       'Non sono riuscito a generare una risposta.';
 
     res.status(200).json({ answer });
   } catch (err) {
-    console.error('Errore /api/ai-chat:', err);
-    res.status(500).json({ error: 'Errore interno server AI' });
+    console.error('Errore /api/ai-chat (Groq):', err);
+    res.status(500).json({ error: 'Errore interno server AI (Groq)' });
   }
 });
 
