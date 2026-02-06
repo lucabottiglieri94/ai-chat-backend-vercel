@@ -1,0 +1,14 @@
+{
+  "name": "ai-chat-backend-vercel",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "api/ai-chat.js",
+  "scripts": {
+    "start": "node api/ai-chat.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.0",
+    "openai": "^4.0.0"
+  }
+}
