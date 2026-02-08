@@ -22,7 +22,7 @@ function initFirebaseAdmin() {
   const privateKey = (process.env.FIREBASE_PRIVATE_KEY || "").replace(/\\n/g, "\n");
 
   if (!projectId || !clientEmail || !privateKey) {
-    console.warn("⚠️ Firebase Admin ENV mancanti (FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY).");
+    console.warn("⚠️ Firebase Admin ENV mancanti (PROJECT_ID / CLIENT_EMAIL / PRIVATE_KEY).");
   }
 
   initializeApp({
@@ -42,14 +42,11 @@ const adminAuth = getAuth();
 // =====================
 const app = express();
 
-// 🔒 Se vuoi più sicurezza: sostituisci "*" con "https://lucabottiglieri94.github.io"
-app.use(
-  cors({
-    origin: "*",
-    methods: ["POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
+app.use(cors({
+  origin: "*",
+  methods: ["POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}));
 
 app.use(express.json({ limit: "1mb" }));
 
@@ -62,27 +59,21 @@ function getBearerToken(req) {
   return m ? m[1] : null;
 }
 
-function clampString(s, max = 40000) {
+function clampString(s, max = 30000) {
   if (typeof s !== "string") return "";
   return s.slice(0, max);
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
-// =====================
-// Groq retry helper
-// =====================
 async function callGroqWithRetry(payload, maxRetries = 3) {
   let attempt = 0;
-  let lastErrText = "";
 
   while (attempt <= maxRetries) {
     const res = await fetch(GROQ_API_URL, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${GROQ_API_KEY}`,
+        "Authorization": `Bearer ${GROQ_API_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(payload),
@@ -90,41 +81,33 @@ async function callGroqWithRetry(payload, maxRetries = 3) {
 
     if (res.ok) return res;
 
-    lastErrText = await res.text().catch(() => "");
-
-    // 429 → rate limit
+    // 429 → backoff
     if (res.status === 429) {
       const retryAfter = parseInt(res.headers.get("retry-after") || "", 10);
       const waitMs = Number.isFinite(retryAfter)
         ? retryAfter * 1000
-        : Math.min(15000, 1000 * Math.pow(2, attempt)); // 1s,2s,4s,8s (max 15s)
+        : Math.min(15000, 1000 * Math.pow(2, attempt)); // 1s 2s 4s 8s... max 15s
 
-      console.warn(`⚠️ Groq 429 (attempt ${attempt + 1}/${maxRetries + 1}) → attendo ${waitMs}ms`);
+      console.warn(`⚠️ Groq 429 (attempt ${attempt+1}/${maxRetries+1}) → attendo ${waitMs}ms`);
       await sleep(waitMs);
       attempt++;
       continue;
     }
 
-    // 5xx → retry leggero
+    // 5xx → piccolo retry
     if (res.status >= 500 && attempt < maxRetries) {
       const waitMs = Math.min(6000, 800 * (attempt + 1));
-      console.warn(`⚠️ Groq ${res.status} (attempt ${attempt + 1}/${maxRetries + 1}) → attendo ${waitMs}ms`);
+      console.warn(`⚠️ Groq ${res.status} (attempt ${attempt+1}) → attendo ${waitMs}ms`);
       await sleep(waitMs);
       attempt++;
       continue;
     }
 
-    // altri errori → stop
-    return new Response(
-      JSON.stringify({ error: "Groq API error", status: res.status, detail: lastErrText }),
-      { status: res.status, headers: { "Content-Type": "application/json" } }
-    );
+    return res;
   }
 
-  return new Response(
-    JSON.stringify({ error: "Groq API error", status: 429, detail: lastErrText }),
-    { status: 429, headers: { "Content-Type": "application/json" } }
-  );
+  // fallback
+  return new Response(JSON.stringify({ error: "Groq API error" }), { status: 429 });
 }
 
 // =====================
@@ -136,10 +119,10 @@ app.post("/api/ai-chat", async (req, res) => {
       return res.status(500).json({ error: "Missing GROQ_API_KEY env" });
     }
 
-    // 1) Verifica token Firebase (OBBLIGATORIO)
+    // 1) TOKEN OBBLIGATORIO
     const token = getBearerToken(req);
     if (!token) {
-      return res.status(401).json({ error: "Missing Authorization: Bearer <idToken>" });
+      return res.status(401).json({ error: "Missing Authorization Bearer token" });
     }
 
     let decoded;
@@ -150,19 +133,18 @@ app.post("/api/ai-chat", async (req, res) => {
       return res.status(401).json({ error: "Invalid token" });
     }
 
-    const uid = decoded.uid;
+    const uid = decoded.uid; // ✅ SOLO DA TOKEN
 
-    // 2) Input
+    // 2) INPUT
     const question = (req.body?.question || "").toString().trim();
-    const month = (req.body?.month || req.body?.budget?.month || "").toString().trim(); // "2026-02"
+    const month = (req.body?.month || req.body?.budget?.month || "").toString().trim();
     const context_html = clampString(req.body?.context_html, 30000);
     const budgetFromClient = req.body?.budget || {};
 
     if (!question) return res.status(400).json({ error: 'Missing "question"' });
     if (!month) return res.status(400).json({ error: 'Missing "month" (es. "2026-02")' });
 
-    // 3) Legge Firestore SOLO dell'utente corrente
-    // users/{uid}/budgets/{month}
+    // 3) LEGGE SOLO I DATI DI QUELL'UTENTE
     let datiBudget = null;
     try {
       const ref = db.collection("users").doc(uid).collection("budgets").doc(month);
@@ -170,10 +152,8 @@ app.post("/api/ai-chat", async (req, res) => {
       datiBudget = snap.exists ? snap.data() : null;
     } catch (e) {
       console.error("❌ Errore lettura Firestore:", e?.message || e);
-      // non blocco: posso rispondere usando il DOM
     }
 
-    // 4) Contesto unificato (NO altri utenti)
     const mergedBudget = {
       uid,
       month,
@@ -183,48 +163,36 @@ app.post("/api/ai-chat", async (req, res) => {
 
     const mergedBudgetJSON = JSON.stringify(mergedBudget, null, 2);
 
-    // 5) Prompt coach + azioni + warning + coerenza
+    // 4) PROMPT
     const systemPrompt = `
 Sei un assistente AI/coach per il budget personale.
 
-REGOLE IMPORTANTI:
-- Rispondi SOLO usando i dati forniti in "DATI BUDGET" (JSON) e nel "CONTESTO HTML".
-- NON inventare numeri o voci. Se un dato manca, dillo chiaramente.
+REGOLE:
+- Rispondi SOLO usando i dati nel JSON "DATI BUDGET".
+- Non inventare numeri. Se mancano dati, dillo.
 - Non usare dati di altri utenti: l'utente corrente è uid=${uid} e month=${month}.
 
 STILE:
-- Parla come un coach: chiaro, motivante, concreto.
-- Se l'utente chiede un confronto ("confronta", "mese scorso", ecc.) usa i dati disponibili e spiega bene.
-- Dai WARNING automatici se noti:
-  - risparmio negativo
-  - spese troppo alte rispetto alle entrate
-  - obiettivo non raggiungibile con i numeri attuali
-  - spesa alimentare sforata (se presente)
+- Coach: chiaro, motivante, concreto.
+- Se fai calcoli: mostra una riga semplice.
+- Dai warning se risparmio negativo o spese alte.
 
 AZIONI:
-Quando utile, termina con una sezione "AZIONI:" con 2-5 azioni REALI nella pagina, esempi:
-- "Riduci una voce spese"
-- "Aggiungi una nuova entrata"
-- "Controlla la spesa settimanale"
-- "Rinomina una voce per capirla meglio"
-Le azioni devono essere coerenti con i dati.
-
-COERENZA:
-- Non contraddire i dati già citati.
-- Se fai calcoli, mostra 1 riga di calcolo semplice (entrate - spese = risparmio).
+Chiudi (quando utile) con "AZIONI:" e 2–5 azioni pratiche nella pagina:
+- riduci una voce spese / aggiungi entrata / controlla spesa settimanale / ecc.
 
 DATI BUDGET (JSON):
 \`\`\`json
 ${mergedBudgetJSON}
 \`\`\`
 
-CONTESTO HTML (opzionale):
+CONTESTO HTML (facoltativo):
 ${context_html}
 `.trim();
 
     const userPrompt = `Domanda utente:\n${question}`.trim();
 
-    // 6) Chiamata Groq (con retry 429)
+    // 5) CHIAMATA GROQ
     const groqPayload = {
       model: "llama-3.1-8b-instant",
       messages: [
@@ -236,19 +204,14 @@ ${context_html}
 
     const groqResponse = await callGroqWithRetry(groqPayload, 3);
 
-    // Se ancora non OK
     if (!groqResponse.ok) {
-      let errText = "";
-      try {
-        errText = await groqResponse.text();
-      } catch {}
-
+      const errText = await groqResponse.text().catch(() => "");
       console.error("Groq API error:", groqResponse.status, errText);
 
       if (groqResponse.status === 429) {
         return res.status(429).json({
           error: "RATE_LIMIT",
-          message: "Sto ricevendo troppe richieste in questo momento. Aspetta 10–20 secondi e riprova.",
+          message: "Troppe richieste. Aspetta 10–20 secondi e riprova.",
           status: 429,
         });
       }
@@ -256,7 +219,7 @@ ${context_html}
       return res.status(500).json({
         error: "Groq API error",
         status: groqResponse.status,
-        detail: (errText || "").slice(0, 400),
+        detail: errText?.slice(0, 400),
       });
     }
 
@@ -264,6 +227,7 @@ ${context_html}
     const answer = data?.choices?.[0]?.message?.content || "Non sono riuscito a generare una risposta.";
 
     return res.status(200).json({ answer });
+
   } catch (err) {
     console.error("Errore /api/ai-chat:", err);
     return res.status(500).json({ error: "Errore interno server AI" });
