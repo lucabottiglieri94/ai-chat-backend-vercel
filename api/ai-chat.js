@@ -163,21 +163,95 @@ ${context_html}
     const userPrompt = `Domanda utente:\n${question}`.trim();
 
     // 6) Chiamata Groq
-    const groqResponse = await fetch(GROQ_API_URL, {
-      method: "POST",
+    // ===== Groq call con RETRY su 429 + backoff =====
+async function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+async function callGroqWithRetry(payload, maxRetries = 3) {
+  let attempt = 0;
+  let lastErrText = "";
+
+  while (attempt <= maxRetries) {
+    const res = await fetch(GROQ_API_URL, {
+      method: 'POST',
       headers: {
-        "Authorization": `Bearer ${GROQ_API_KEY}`,
-        "Content-Type": "application/json",
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
+        'Content-Type': 'application/json'
       },
-      body: JSON.stringify({
-        model: "llama-3.1-8b-instant",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: userPrompt },
-        ],
-        temperature: 0.3,
-      }),
+      body: JSON.stringify(payload)
     });
+
+    // OK
+    if (res.ok) return res;
+
+    lastErrText = await res.text().catch(() => "");
+
+    // 429: rate limit → aspetta e riprova
+    if (res.status === 429) {
+      // Prova a leggere Retry-After header, altrimenti backoff
+      const retryAfter = parseInt(res.headers.get("retry-after") || "", 10);
+      const waitMs = Number.isFinite(retryAfter)
+        ? retryAfter * 1000
+        : Math.min(15000, 1000 * Math.pow(2, attempt)); // 1s,2s,4s,8s... max 15s
+
+      console.warn(`⚠️ Groq 429 (attempt ${attempt+1}/${maxRetries+1}) → attendo ${waitMs}ms`);
+      await sleep(waitMs);
+      attempt++;
+      continue;
+    }
+
+    // altri errori: non retry aggressivo
+    if (res.status >= 500 && attempt < maxRetries) {
+      const waitMs = Math.min(6000, 800 * (attempt + 1));
+      console.warn(`⚠️ Groq ${res.status} (attempt ${attempt+1}) → attendo ${waitMs}ms`);
+      await sleep(waitMs);
+      attempt++;
+      continue;
+    }
+
+    // se non gestibile → ritorna res così lo gestiamo fuori
+    return res;
+  }
+
+  // fallback (teorico)
+  const fake = new Response(JSON.stringify({ error: "Groq API error", detail: lastErrText }), { status: 429 });
+  return fake;
+}
+
+// ===== Chiamata Groq usando retry =====
+const groqPayload = {
+  model: 'llama-3.1-8b-instant',
+  messages: [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: userPrompt }
+  ],
+  temperature: 0.3
+};
+
+const groqResponse = await callGroqWithRetry(groqPayload, 3);
+
+// Se ancora non OK: rispondiamo in modo “umano”
+if (!groqResponse.ok) {
+  const errText = await groqResponse.text().catch(() => "");
+  console.error('Groq API error:', groqResponse.status, errText);
+
+  if (groqResponse.status === 429) {
+    return res.status(429).json({
+      error: 'RATE_LIMIT',
+      message: "Sto ricevendo troppe richieste in questo momento. Aspetta 10–20 secondi e riprova.",
+      status: 429
+    });
+  }
+
+  return res.status(500).json({
+    error: 'Groq API error',
+    status: groqResponse.status,
+    detail: errText?.slice(0, 400)
+  });
+}
+
+const data = await groqResponse.json();
+const answer = data.choices?.[0]?.message?.content || 'Non sono riuscito a generare una risposta.';
+return res.status(200).json({ answer });
 
     if (!groqResponse.ok) {
       const errText = await groqResponse.text().catch(() => "");
